@@ -8,18 +8,25 @@ namespace Ui {
 class MainWindow;
 }
 
-class MainWindow : public QMainWindow
-{
+class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
     explicit MainWindow(QWidget *parent = 0);
-//    void capture();
     ~MainWindow();
 
     void paintEvent(QPaintEvent *event);
+    void timerEvent(QTimerEvent *);
+    void resizeEvent(QResizeEvent *event);
+public slots:
+    void captureFrame ();
+    void startCapturing ();
+    void stopCapturing ();
+
 private:
     CameraHandler m_camera;
+    QImage m_frame;
+    int m_timerId {};
     Ui::MainWindow *ui;
 };
 

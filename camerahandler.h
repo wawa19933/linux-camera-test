@@ -21,21 +21,53 @@ Q_DECLARE_LOGGING_CATEGORY(camera)
 
 struct Buffer {
     void* address {};
-    size_t length {};
+    quint64 length {};
 };
 
 class VideoFrame;
 class FrameBuffer;
 
-enum class Format { RGB = V4L2_PIX_FMT_RGB24, BGR = V4L2_PIX_FMT_BGR24,
-                    Grey = V4L2_PIX_FMT_GREY };
+enum class PixelFormat {
+    RGB = V4L2_PIX_FMT_RGB24,
+    BGR = V4L2_PIX_FMT_BGR24,
+/* Luminance+Chrominance formats */
+    YUYV = V4L2_PIX_FMT_YUYV,
+    YYUV = V4L2_PIX_FMT_YYUV,
+    YVYU = V4L2_PIX_FMT_YVYU,
+    UYVY = V4L2_PIX_FMT_UYVY,
+    YUV444 = V4L2_PIX_FMT_YUV444,
+    YUV555 = V4L2_PIX_FMT_YUV555,
+    YUV565 = V4L2_PIX_FMT_YUV565,
+    YUV32 = V4L2_PIX_FMT_YUV32,
+/* three planes - Y Cb, Cr */
+    YUV410 = V4L2_PIX_FMT_YUV410,
+    YUV411P = V4L2_PIX_FMT_YUV411P,
+    YUV420 = V4L2_PIX_FMT_YUV420,
+    YUV422P = V4L2_PIX_FMT_YUV422P,
+    YVU410 = V4L2_PIX_FMT_YVU410,
+    YVU420 = V4L2_PIX_FMT_YVU420,
+/* three non contiguous planes - Y, Cb, Cr */
+    YUV420M = V4L2_PIX_FMT_YUV420M,
+    YVU420M = V4L2_PIX_FMT_YVU420M,
+    YUV422M = V4L2_PIX_FMT_YUV422M,
+    YVU422M = V4L2_PIX_FMT_YVU422M,
+/* compressed formats */
+    MJPEG = V4L2_PIX_FMT_MJPEG,
+    JPEG = V4L2_PIX_FMT_JPEG,
+    MPEG = V4L2_PIX_FMT_MPEG,
+    MPEG1 = V4L2_PIX_FMT_MPEG1,
+    MPEG2 = V4L2_PIX_FMT_MPEG2,
+    MPEG4 = V4L2_PIX_FMT_MPEG4,
+    H264 = V4L2_PIX_FMT_H264,
+    Grey = V4L2_PIX_FMT_GREY
+};
+
 enum class Colorspace { Default = V4L2_COLORSPACE_DEFAULT, sRGB = V4L2_COLORSPACE_SRGB,
                        AdobeRGB = V4L2_COLORSPACE_ADOBERGB, JPEG = V4L2_COLORSPACE_JPEG,
                        RAW = V4L2_COLORSPACE_RAW };
 
 
-class CameraHandler
-{
+class CameraHandler {
 public:
     CameraHandler (const char* path = "/dev/video0");
 
@@ -51,68 +83,73 @@ public:
         struct v4l2_crop crop;
         return (ioctl(m_handler, VIDIOC_S_CROP, &crop) != -1);
     }
-    QString deviceName () const { return (const char*)m_capability.card; }
+    QString deviceName () const { return reinterpret_cast<const char*>(m_capability.card); }
     QString driverName () const { return reinterpret_cast<const char*>(m_capability.driver); }
     QString deviceBus () const { return reinterpret_cast<const char*>(m_capability.bus_info); }
 
-    Format format() const;
-    void setFormat(const Format &format);
+    PixelFormat format() const;
+    void setFormat(const PixelFormat &format);
 
+    QRect defaultRect () const;
     QSize size() const;
     void setSize(const QSize &size);
-    VideoFrame readFrame();
+    QImage getFrame();
     void close ();
     ~CameraHandler ();
 
 private:
-    bool initDevice ();
-    v4l2_requestbuffers requestBuffers (int count);
-    QVector<Buffer> initBuffer (int count);
     bool setCropping (const QRect& rect);
-    v4l2_format getFormat_ ();
-    v4l2_format setFormat_ (v4l2_format* format = nullptr);
-    bool startStream ();
-    bool stopStream ();
-    v4l2_buffer checkFrame ();
+    v4l2_format getFmt ();
+    v4l2_format setFmt (v4l2_format* fmt);
     void releaseBuffer (const v4l2_buffer& buf);
-    void processingLoop ();
+
+    bool query (quint32 request, void* arg) const;
+    bool openDevice (const char* path);
+    bool initialize ();
+    bool initBuffers (quint32 count);
+    bool getCapabilities ();
+    bool enableStreaming ();
+    bool disableStreaming ();
+    bool releaseBuffer (int index);
+    v4l2_buffer takeBuffer ();
+    void unmapBuffers ();
+    void applySettings ();
 
 private:
-    struct v4l2_format m_format;
     struct v4l2_capability m_capability;
     QVector<Buffer> m_buffers;
-    std::promise<void> m_promise;
-    QSize m_size { 640, 480 };
+//    QRect m_crop { 0, 0, 1280, 720 };
+    QSize m_frameSize { 1280, 720 };
     int m_handler {};
-    Format m_pixelFormat { Format::RGB };
+    PixelFormat m_pixelFormat { PixelFormat::RGB };
     Colorspace m_colorspace { Colorspace::RAW };
 
     friend class VideoFrame;
 };
 
 
-class VideoFrame {
-public:
-    VideoFrame (CameraHandler* handler, v4l2_buffer buf) : m_buffer(buf), m_handler(handler) {}
+//class VideoFrame {
+//public:
+//    VideoFrame (CameraHandler* handler, v4l2_buffer buf) : m_buffer(buf), m_handler(handler) {}
 
-    Buffer& buffer () { return m_handler->m_buffers[m_buffer.index]; }
+//    Buffer& buffer () { return m_handler->m_buffers[m_buffer.index]; }
 
-    const Buffer& buffer () const { return m_handler->m_buffers[m_buffer.index]; }
-    const char* data () const { return (char*) buffer().address; }
-    quint64 size () const { return m_buffer.bytesused; }
-    quint64 length () const { return m_buffer.bytesused; }
+//    const Buffer& buffer () const { return m_handler->m_buffers[m_buffer.index]; }
+//    const char* data () const { return (char*) buffer().address; }
+//    quint64 size () const { return m_buffer.bytesused; }
+//    quint64 length () const { return m_buffer.bytesused; }
 
-    QImage toImage () const;
-//    QPixmap toPixmap () const;
+//    QImage toImage () const;
+////    QPixmap toPixmap () const;
 
-    ~VideoFrame () {
-        m_handler->releaseBuffer(m_buffer);
-    }
+//    ~VideoFrame () {
+//        m_handler->releaseBuffer(m_buffer);
+//    }
 
-private:
-    v4l2_buffer m_buffer;
-    CameraHandler* m_handler {};
-};
+//private:
+//    v4l2_buffer m_buffer;
+//    CameraHandler* m_handler {};
+//};
 
 
 #endif // CAMERAHANDLER_H

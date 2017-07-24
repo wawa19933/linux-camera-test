@@ -9,371 +9,304 @@
 #include <sys/mman.h>
 #include <QSize>
 #include <iostream>
+#include <QMap>
 
+static QMap<quint32, QString> options = {
+    { VIDIOC_QUERYCAP, "Quering capabilites" },
+    { VIDIOC_CREATE_BUFS, "Creating buffers" },
+    { VIDIOC_CROPCAP, "Getting crop capabilites" },
+    { VIDIOC_DQBUF, "Taking buffer from driver queue" },
+    { VIDIOC_QBUF, "Releasing buffer to driver queue" },
+    { VIDIOC_QUERYBUF, "Requesting buffers" },
+    { VIDIOC_STREAMON, "Starting stream" },
+    { VIDIOC_STREAMOFF, "Stopping stream" },
+    { VIDIOC_S_CROP, "Setting crop" },
+    { VIDIOC_G_CROP, "Getting crop" },
+    { VIDIOC_S_FMT, "Setting format" },
+    { VIDIOC_G_FMT, "Getting format" }
+};
+
+//static QMap<PixelFormat,QImage::Format> imageFormats = {
+//    { PixelFormat::RGB, QImage::FOR
+//};
 
 Q_LOGGING_CATEGORY(camera, "camera.handler")
 #define LOG_ERROR qCCritical(camera)
 #define LOG_DEBUG qCDebug(camera)
 #define LOG_WARN qCWarning(camera)
 
-bool checkPath (const char* path) {
-    struct stat64 st;
-    if (stat64(path, &st) == -1) {
-        qCCritical(camera) << "Cannot stat" << path << ":" << strerror(errno);
-        return false;
-    }
 
-    if (!S_ISCHR(st.st_mode)) {
-        LOG_ERROR << "Not a character device" << path;
-        return false;
-    }
-    return true;
-}
-
-static QImage::Format convertFormat (Format f) {
+static QImage::Format convertFormat (PixelFormat f) {
     switch (f) {
-    case Format::BGR:
+    case PixelFormat::BGR:
         return QImage::Format_BGR30;
-    case Format::RGB:
+    case PixelFormat::RGB:
         return QImage::Format_RGB888;
-    case Format::Grey:
+    case PixelFormat::Grey:
         return QImage::Format_Grayscale8;
     default:
         return QImage::Format_Invalid;
     }
 }
 
-static int xioctl (int fh, int request, void *arg) {
-    int r;
-    do {
-        r = ioctl(fh, request, arg);
-    } while (-1 == r && EINTR == errno);
-    if (r == -1)
-        LOG_ERROR << "ioctl: " << strerror(errno);
-    return r;
-}
-
-static void unmapAll (QVector<Buffer>& buffers) {
-    for (auto& buf : buffers) {
-        munmap(buf.address, buf.length);
+CameraHandler::CameraHandler(const char *path) {
+    CLEAR(m_capability);
+    if (!(openDevice(path) && initialize())) {
+        close();
     }
 }
 
-CameraHandler::CameraHandler(const char *path) {
-    memset(&m_capability, 0, sizeof(m_capability));
-    if (checkPath(path))
-        m_handler = open(path, O_RDWR | O_NONBLOCK, 0);
+QImage CameraHandler::getFrame() {
+    auto buf = takeBuffer();
+    QImage img;
+    if (buf.bytesused == 0) {
+        return img;
+    }
+    img.loadFromData(reinterpret_cast<const uchar*>(m_buffers[static_cast<int>(buf.index)].address), buf.bytesused, "jpeg");
+    releaseBuffer(buf.index);
+    return img;
+//    return QImage(reinterpret_cast<const uchar*>(m_buffers[static_cast<int>(buf.index)].address),
+//            m_frameSize.width(), m_frameSize.height(), QImage::Format_RGB888);
+}
+
+bool CameraHandler::query (quint32 request, void *arg) const {
+    int res;
+    do {
+        res = ioctl(m_handler, request, arg);
+    } while (res == -1 && errno == EINTR);
+
+    if (res == -1) {
+        if (options.contains(request))
+            LOG_ERROR << options[request] << ":" << strerror(errno);
+        else
+            LOG_ERROR << "ioctl: " << strerror(errno);
+    }
+    return res == 0;
+}
+
+bool CameraHandler::openDevice(const char *path) {
+    struct stat64 st;
+    if (stat64(path, &st) == -1) {
+        LOG_ERROR << "Cannot stat" << path << ":" << strerror(errno);
+        return false;
+    }
+    if (!S_ISCHR(st.st_mode)) {
+        LOG_ERROR << "Not a character device" << path;
+        return false;
+    }
+    // Open device
+    m_handler = open(path, O_RDWR | O_NONBLOCK, 0);
     if (m_handler == -1) {
-        CLEAR(m_capability);
         m_handler = 0;
         LOG_ERROR << "Cannot open" << path << "|" << errno << strerror(errno);
-    }
-    if (!initDevice()) {
-        m_handler = 0;
-    }
-}
-
-bool CameraHandler::initDevice() {
-    if (!m_handler)
-        return false;
-
-    int res = 0;
-    res = xioctl(m_handler, VIDIOC_QUERYCAP, &m_capability);
-    if (res == -1) {
-        LOG_ERROR << "Cannot query capabilities. Not V4L device? :" << strerror(errno);
         return false;
     }
-
-    if (!isCapture()) {
-        LOG_WARN << "Device does not support capture!";
-    }
-    if (!isStreaming()) {
-        LOG_WARN << "No streaming capability!";
-    }
-    if (!isReadWrite()) {
-        LOG_WARN << "Device does not support read/write syscall!";
-    }
-//    setCropping(QRect());
-//    auto fmt = getFormat_();
-//    setFormat_(&fmt);
-    initBuffer(requestBuffers(10).count);
-    startStream();
     return true;
 }
 
-v4l2_requestbuffers CameraHandler::requestBuffers(int count) {
+bool CameraHandler::initialize() {
+    if (!getCapabilities())
+        return false;
+    if (!isCapture())
+        LOG_WARN << "Device does not support capture!";
+    if (!isStreaming())
+        LOG_WARN << "No streaming capability!";
+// Cropping
+//    if (!setCropping(defaultRect()));
+//    m_crop = defaultRect();
+// Format
+    auto fmt = getFmt();
+    m_colorspace = static_cast<Colorspace>(fmt.fmt.pix.colorspace);
+    m_pixelFormat = static_cast<PixelFormat>(fmt.fmt.pix.pixelformat);
+    m_frameSize.setWidth(fmt.fmt.pix.width);
+    m_frameSize.setHeight(fmt.fmt.pix.height);
+    // Initialize buffer
+    if (!initBuffers(10))
+        return false;
+    if (!enableStreaming())
+        return false;
+    return true;
+}
+
+bool CameraHandler::initBuffers (quint32 count) {
     struct v4l2_requestbuffers req;
     CLEAR(req);
     req.count = count;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(m_handler, VIDIOC_REQBUFS, &req) == -1) {
-        if (errno == EINVAL)
-            LOG_ERROR << "Device does not support memory mapping";
-        else
-            LOG_ERROR << "Cannot request buffers:" << strerror(errno);
-        CLEAR(req);
-    }
-    if (req.count < 2) {
-        LOG_ERROR << "Insufficient beffer memory!";
-        CLEAR(req);
-    }
-    return req;
-}
+    if (!query(VIDIOC_REQBUFS, &req))
+        return false;
 
-v4l2_format CameraHandler::getFormat_() {
-    struct v4l2_format fmt;
-    CLEAR(fmt);
-    if (xioctl(m_handler, VIDIOC_G_FMT, &fmt) == -1) {
-        LOG_ERROR << "GetFormat:" << strerror(errno);
-    }
-    return fmt;
-}
-
-VideoFrame CameraHandler::readFrame() {
+    m_buffers.resize(static_cast<int>(req.count));
     struct v4l2_buffer buf;
     CLEAR(buf);
-
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-//    while (true) {
-//        fd_set fds;
-//        struct timeval tv;
-//        int r;
-
-//        FD_ZERO(&fds);
-//        FD_SET(m_handler, &fds);
-
-//        /* Timeout. */
-//        tv.tv_sec = 2;
-//        tv.tv_usec = 0;
-
-//        r = select(m_handler + 1, &fds, NULL, NULL, &tv);
-
-//        if (-1 == r) {
-//            if (EINTR == errno)
-//                continue;
-//            LOG_ERROR << "Processing loop:" << strerror(errno);
-//            break;
-//        }
-//        if (r == 0) {
-//            LOG_ERROR << "select timeout";
-//        }
-//    }
-
-    int res = xioctl(m_handler, VIDIOC_DQBUF, &buf);
-    while (res) {
-        if (res == -1 && errno != EAGAIN) {
-            LOG_ERROR << "readFrame error:" << strerror(errno);
-//            break;
-        }
-        res = xioctl(m_handler, VIDIOC_DQBUF, &buf);
-    }
-
-    assert(buf.index < (quint64)m_buffers.size());
-
-    return VideoFrame(this, buf);
-}
-
-v4l2_buffer CameraHandler::checkFrame() {
-    struct v4l2_buffer buf;
-    CLEAR(buf);
-
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    if (xioctl(m_handler, VIDIOC_DQBUF, &buf) == -1) {
-        switch (errno) {
-        case EAGAIN:
-            CLEAR(buf);
-            return buf;
-        case EIO:
-            /* fall through */
-        default:
-            LOG_WARN << "Get image error:" << strerror(errno);
-            CLEAR(buf);
-            return buf;
-        }
-    }
-
-    assert(buf.index < (quint64) m_buffers.size());
-    return buf;
-}
-
-void CameraHandler::releaseBuffer(const v4l2_buffer& buf) {
-    if (-1 == xioctl(m_handler, VIDIOC_QBUF, const_cast<v4l2_buffer*>(&buf)))
-        LOG_ERROR << "Failed to return buffer to queue! Index:" << buf.index;
-}
-
-void CameraHandler::processingLoop()
-{
-    for (;;) {
-        fd_set fds;
-        struct timeval tv;
-        int r;
-
-        FD_ZERO(&fds);
-        FD_SET(m_handler, &fds);
-
-        /* Timeout. */
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-
-        r = select(m_handler + 1, &fds, NULL, NULL, &tv);
-
-        if (-1 == r) {
-            if (EINTR == errno)
-                continue;
-            LOG_ERROR << "Processing loop:" << strerror(errno);
-            break;
-        }
-
-        if (0 == r) {
-            LOG_ERROR << "select() timeout!";
-            break;
-        }
-
-        auto buf = checkFrame();
-        if (!buf.bytesused)
-            break;
-        /* EAGAIN - continue select loop. */
-    }
-}
-
-v4l2_format CameraHandler::setFormat_ (v4l2_format* format) {
-    v4l2_format fmt;
-    if (format) {
-        fmt = *format;
-    } else {
-        CLEAR(fmt);
-    }
-
-    fmt.fmt.pix.width = m_size.width();
-    fmt.fmt.pix.height = m_size.height();
-    fmt.fmt.pix.pixelformat = static_cast<quint32>(m_pixelFormat);
-    fmt.fmt.pix.colorspace = static_cast<quint32>(m_colorspace);
-    fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
-    xioctl(m_handler, VIDIOC_S_FMT, &fmt);
-    return fmt;
-}
-
-QVector<Buffer> CameraHandler::initBuffer (int count) {
-    auto req = requestBuffers(count);
-
-    QVector<Buffer> buffers;
-    buffers.resize(count);
-    for (quint32 i = 0; i < req.count; ++i) {
-        struct v4l2_buffer buff;
-        CLEAR(buff);
-        buff.type = req.type;
-        buff.memory = V4L2_MEMORY_MMAP;
-        buff.index = i;
-
-        if (xioctl(m_handler, VIDIOC_QUERYBUF, &buff) == -1) {
-            LOG_ERROR << "Cannot query memory from device!";
-        }
-        buffers[i] = { mmap(nullptr, buff.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-                           m_handler, buff.m.offset),
-                           buff.length };
-        if (buffers[i].address == MAP_FAILED) {
-            LOG_ERROR << "mmap failed!";
-            unmapAll(buffers);
-            buffers.clear();
-            break;
-        }
-    }
-    return buffers;
-}
-
-bool CameraHandler::startStream() {
-    for (int i = 0; i < m_buffers.size(); ++i) {
-        struct v4l2_buffer buf;
-        CLEAR(buf);
+    for (qint32 i = 0; i < m_buffers.size(); ++i) {
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
-        if (xioctl(m_handler, VIDIOC_QBUF, &buf) == -1) {
-//            close();
+        if (!query(VIDIOC_QUERYBUF, &buf))
+            return false;
+
+        m_buffers[i].length = buf.length;
+        m_buffers[i].address = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     m_handler, buf.m.offset);
+
+        if (m_buffers[i].address == MAP_FAILED) {
+            LOG_ERROR << "mmap() failed!";
+            m_buffers.clear();
             return false;
         }
     }
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    return xioctl(m_handler, VIDIOC_STREAMON, &type) != -1;
+    return true;
 }
 
-bool CameraHandler::stopStream() {
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    return xioctl(m_handler, VIDIOC_STREAMOFF, &type) != -1;
+bool CameraHandler::getCapabilities() {
+    return query(VIDIOC_QUERYCAP, &m_capability);
+}
+
+bool CameraHandler::enableStreaming() {
+    for (int i = 0; i < m_buffers.size(); ++i)
+        releaseBuffer(i);
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    return query(VIDIOC_STREAMON, &type);
+}
+
+bool CameraHandler::disableStreaming() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    return query(VIDIOC_STREAMOFF, &type);
+}
+
+bool CameraHandler::releaseBuffer(int index) {
+    struct v4l2_buffer buf;
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = index;
+    return query(VIDIOC_QBUF, &buf);
+}
+
+v4l2_buffer CameraHandler::takeBuffer() {
+    struct v4l2_buffer buf;
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    //TODO: EAGAIN handling
+    if (!query(VIDIOC_DQBUF, &buf))
+        CLEAR(buf);
+    return buf;
+}
+
+void CameraHandler::unmapBuffers() {
+    for (auto& buffer : m_buffers) {
+        if (munmap(buffer.address, buffer.length) == -1)
+            LOG_ERROR << "Memory unmap failed:" << strerror(errno);
+    }
+}
+
+void CameraHandler::applySettings() {
+    auto fmt = getFmt();
+    fmt.fmt.pix.pixelformat = static_cast<quint32>(m_pixelFormat);
+    fmt.fmt.pix.width = m_frameSize.width();
+    fmt.fmt.pix.height = m_frameSize.height();
+    setFmt(&fmt);
+    if (fmt.fmt.pix.width != static_cast<quint32>(m_frameSize.width())
+            || fmt.fmt.pix.height != static_cast<quint32>(m_frameSize.height())) {
+        LOG_WARN << "Cannot set frame size";
+        m_frameSize.setWidth(fmt.fmt.pix.width);
+        m_frameSize.setHeight(fmt.fmt.pix.height);
+    }
+    if (fmt.fmt.pix.colorspace != static_cast<quint32>(m_colorspace)) {
+        LOG_WARN << "Cannot set colorspace";
+        m_colorspace = static_cast<Colorspace>(fmt.fmt.pix.colorspace);
+    }
+    if (fmt.fmt.pix.pixelformat != static_cast<quint32>(m_pixelFormat)) {
+        LOG_WARN << "Cannot set pixel format";
+        m_pixelFormat = static_cast<PixelFormat>(fmt.fmt.pix.pixelformat);
+    }
+}
+
+v4l2_format CameraHandler::getFmt () {
+    struct v4l2_format fmt;
+    CLEAR(fmt);
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (!query(VIDIOC_G_FMT, &fmt))
+        CLEAR(fmt);
+    return fmt;
+}
+
+v4l2_format CameraHandler::setFmt (v4l2_format* fmt) {
+    fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    query(VIDIOC_S_FMT, fmt);
+    return *fmt;
 }
 
 bool CameraHandler::setCropping(const QRect& rect) {
-    struct v4l2_cropcap cropcap;
     struct v4l2_crop crop;
-    CLEAR(cropcap);
     CLEAR(crop);
+    crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    crop.c.top = rect.top();
+    crop.c.left = rect.left();
+    crop.c.width = rect.width();
+    crop.c.height = rect.height();
 
-    cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(m_handler, VIDIOC_CROPCAP, &cropcap) == 0) {
-        crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        crop.c.top = rect.top();
-        crop.c.left = rect.left();
-        crop.c.width = rect.width();
-        crop.c.height = rect.height();
-        if (rect.isEmpty())
-            crop.c = cropcap.defrect;
-
-        if (-1 == xioctl(m_handler, VIDIOC_S_CROP, &crop)) {
-            switch (errno) {
-            case EINVAL:
-            default:
-                LOG_WARN << "Cropping is not supported!";
-                return false;
-            }
-        }
-    } else {
-        LOG_WARN << "setCropping error:" << strerror(errno);
+    if (!query(VIDIOC_S_CROP, &crop)) {
+        if (errno == EINVAL)
+            LOG_WARN << "Cropping is not supported!";
         return false;
     }
     return true;
 }
 
 QSize CameraHandler::size() const {
-    return m_size;
+    return m_frameSize;
 }
 
 void CameraHandler::setSize(const QSize &size) {
-    m_size = size;
+    auto fmt = getFmt();
+    fmt.fmt.pix.width = size.width();
+    fmt.fmt.pix.height = size.height();
+    disableStreaming();
+    setFmt(&fmt);
+    enableStreaming();
+    if (fmt.fmt.pix.width != size.width() || fmt.fmt.pix.height != size.height())
+        LOG_WARN << "Cannot change frame size";
+    else
+        m_frameSize = size;
 }
 
 void CameraHandler::close() {
-    unmapAll(m_buffers);
+    unmapBuffers();
     m_buffers.clear();
     ::close(m_handler);
     m_handler = 0;
     CLEAR(m_capability);
-    CLEAR(m_format);
 }
 
 CameraHandler::~CameraHandler() {
     close();
 }
 
-Format CameraHandler::format() const {
+PixelFormat CameraHandler::format() const {
     return m_pixelFormat;
 }
 
-void CameraHandler::setFormat(const Format &format) {
-    m_pixelFormat = format;
+void CameraHandler::setFormat(const PixelFormat &format) {
+    auto fmt = getFmt();
+    fmt.fmt.pix.pixelformat = static_cast<quint32>(m_pixelFormat);
+    setFmt(&fmt);
+    if (fmt.fmt.pix.pixelformat == static_cast<quint32>(m_pixelFormat))
+        m_pixelFormat = format;
+    else
+        LOG_WARN << "Cannot change pixel format";
 }
 
+QRect CameraHandler::defaultRect() const {
+    struct v4l2_cropcap cropcap;
+    CLEAR(cropcap);
 
-
-QImage VideoFrame::toImage() const {
-    return QImage((const uchar*) buffer().address, m_handler->size().width(),
-                  m_handler->size().height(), convertFormat(m_handler->format()));
+    cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (!query(VIDIOC_CROPCAP, &cropcap)) {
+        return QRect();
+    }
+    return QRect(cropcap.defrect.left, cropcap.defrect.top, cropcap.defrect.width, cropcap.defrect.height);
 }
-
-//QPixmap VideoFrame::toPixmap() const
-//{
-//    return QPixmap()
-//}
